@@ -1,6 +1,9 @@
 import logging
 import os
 import tempfile
+import threading
+import time
+import uuid
 from datetime import datetime, timedelta
 from typing import List, Dict
 
@@ -13,9 +16,9 @@ from langchain_chroma import Chroma
 from langchain_community.document_loaders import WebBaseLoader, PyPDFLoader, TextLoader
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_ollama import ChatOllama
-from telebot.types import InlineKeyboardMarkup
+from telebot.util import quick_markup
 
-from db import add_document, get_current_week_documents
+from db import add_document, document_exists, get_current_week_documents
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -107,10 +110,18 @@ class RAG:
 
 
 class DocumentRAGBot(RAG):
+    # Сколько секунд заметка ждёт подтверждения, прежде чем черновик будет удалён
+    PENDING_NOTE_TTL = 60 * 60
+
     def __init__(self, telegram_token: str):
         super().__init__()
         self.bot = telebot.TeleBot(telegram_token)
-        self.vector_store = None
+        # Черновики заметок, ожидающие подтверждения: note_id -> данные заметки.
+        # Раньше текст заметки жил в замыкании обработчика кнопки, и при каждой
+        # заметке регистрировался новый обработчик. Срабатывал всегда первый,
+        # поэтому подтверждение второй заметки сохраняло текст первой.
+        self.pending_notes: Dict[str, Dict] = {}
+        self.pending_lock = threading.Lock()
         self.setup_handlers()
 
     def setup_handlers(self):
@@ -123,6 +134,7 @@ class DocumentRAGBot(RAG):
 
 *Я могу:*
 🌐 Парсить веб-сайты и ваши заметки
+📨 Сохранять пересланные посты из каналов и чатов
 🔍 Выполнять семантический поиск по документам
 📊 Создавать суммаризации
 📅 Предоставлять отчеты за неделю
@@ -134,8 +146,8 @@ class DocumentRAGBot(RAG):
 *Доступные команды:*
 /start - Начать работу
 /help - Помощь
-/search - Поиск по документам 
-/weekly\_report - Отчет по находкам за неделю
+/search - Поиск по документам
+/weekly\\_report - Отчет по находкам за неделю
 """
             self.bot.reply_to(message, welcome_text, parse_mode='Markdown', disable_web_page_preview=True)
 
@@ -148,72 +160,132 @@ class DocumentRAGBot(RAG):
         def handle_weekly_report(message):
             self.generate_weekly_report(message)
 
-        @self.bot.message_handler(content_types=['text', 'document'])
+        @self.bot.message_handler(content_types=['text', 'document', 'photo', 'video', 'animation', 'audio'])
         def handle_message(message):
-            if message.text and (message.text.startswith('http://') or message.text.startswith('https://')):
+            # Пересланный пост сохраняем сразу: пересылка уже и есть явное намерение сохранить
+            if is_forwarded(message):
+                self.process_forward(message)
+            elif message.text and (message.text.startswith('http://') or message.text.startswith('https://')):
                 self.process_url(message)
             elif message.document:
                 self.bot.reply_to(message, "Обработчик документов находится на стадии разработки")
                 # self.process_document(message)
-            else:
+            elif message.text:
                 self.process_text(message)
+            else:
+                self.bot.reply_to(message, "Пока я умею сохранять только текст, ссылки и пересланные посты")
 
+        # Один обработчик кнопок на всех: какую заметку подтверждают, узнаём по note_id в callback_data
+        @self.bot.callback_query_handler(func=lambda call: call.data.startswith(('note_confirm:', 'note_cancel:')))
+        def handle_note_button(call):
+            action, note_id = call.data.split(':', 1)
+            with self.pending_lock:
+                note = self.pending_notes.get(note_id)
+                # Нажать кнопку может только автор заметки
+                if note is not None and note['user_id'] == call.from_user.id:
+                    self.pending_notes.pop(note_id)
+                elif note is not None:
+                    self.bot.answer_callback_query(call.id, "Это не ваша заметка")
+                    return
+
+            self.bot.answer_callback_query(call.id)
+            chat_id, message_id = call.message.chat.id, call.message.id
+
+            if note is None:
+                self.bot.edit_message_text("Заметка устарела или уже обработана. Отправьте её ещё раз.",
+                                           chat_id=chat_id, message_id=message_id)
+                return
+
+            if action == 'note_cancel':
+                self.bot.edit_message_text("Операция добавления заметки отменена",
+                                           chat_id=chat_id, message_id=message_id)
+                return
+
+            self.bot.send_chat_action(chat_id, 'typing')
+            self.bot.edit_message_text("Идет обработка заметки...", chat_id=chat_id, message_id=message_id)
+            try:
+                document = Document(page_content=note['text'], metadata={'source': note['source']})
+                summary = self.save_to_archive(document, note['user_id'], note['message'])
+                self.bot.edit_message_text(f"✅ Заметка успешно добавлена!\n\n📝 Краткое содержание:\n{summary}",
+                                           chat_id=chat_id, message_id=message_id)
+            except Exception as e:
+                logger.error(f"Error processing note: {e}")
+                self.bot.edit_message_text(f"Ошибка при обработке заметки: {str(e)}",
+                                           chat_id=chat_id, message_id=message_id)
+
+    def save_to_archive(self, document: Document, user_id: int, message: telebot.types.Message) -> str:
+        """Общий путь сохранения: суммаризация, запись в SQLite и в векторное хранилище.
+        Возвращает краткое содержание."""
+        document.metadata['user_id'] = user_id
+        document.metadata['added_date'] = datetime.now().isoformat()
+        document.metadata['summary'] = self.summarize_document(document, message)
+
+        add_document(
+            user_id=user_id,
+            added_date=datetime.fromisoformat(document.metadata['added_date']),
+            source=document.metadata.get('source', ''),
+            title=document.metadata.get('title', ''),
+            all_content=document.page_content,
+            summarize=document.metadata['summary'],
+        )
+        self.add_documents_to_vectorstore([document])
+        return document.metadata['summary']
 
     def process_text(self, message: telebot.types.Message):
-        from telebot.util import quick_markup
-        print(message)
-        # Создаем клавиатуру подтверждения
-        confirmation_id = f"{message.chat.id}_{message.from_user.id}_{message.message_id}"
-        print(confirmation_id)
-        TEXT = message.text
+        """Текстовая заметка: сохраняем после подтверждения кнопкой"""
+        self.drop_expired_notes()
+        note_id = uuid.uuid4().hex[:16]  # callback_data ограничена 64 байтами
+        with self.pending_lock:
+            self.pending_notes[note_id] = {
+                'text': message.text,
+                'user_id': message.from_user.id,
+                'source': message_link(message.chat, message.message_id),
+                'message': message,
+                'created': time.time(),
+            }
+
         markup = quick_markup({
-            "✅ Да, добавить": {'callback_data': f"confirm_{confirmation_id}"},
-            '❌ Нет, отменить': {'callback_data': f"cancel_{confirmation_id}"}
+            "✅ Да, добавить": {'callback_data': f"note_confirm:{note_id}"},
+            '❌ Нет, отменить': {'callback_data': f"note_cancel:{note_id}"}
         }, row_width=2)
         self.bot.reply_to(message, "Вы действительно хотите добавить данную заметку в базу знаний?", reply_markup=markup)
 
-        @self.bot.callback_query_handler(func=lambda call: 'cancel' in call.data)
-        def cancel_btn(call):
-            markup = InlineKeyboardMarkup()
-            # markup.add(InlineKeyboardButton("Кнопка 2", callback_data="but_2"))
-            self.bot.edit_message_reply_markup(chat_id=call.message.chat.id, message_id=call.message.id, reply_markup=markup)
-            self.bot.edit_message_text("Операция добавления заметки отменена", chat_id=call.message.chat.id, message_id=call.message.id)
+    def drop_expired_notes(self):
+        """Удаляем черновики, которые так и не подтвердили, чтобы они не копились в памяти"""
+        deadline = time.time() - self.PENDING_NOTE_TTL
+        with self.pending_lock:
+            for note_id in [k for k, v in self.pending_notes.items() if v['created'] < deadline]:
+                del self.pending_notes[note_id]
 
-        @self.bot.callback_query_handler(func=lambda call: 'confirm' in call.data)
-        def confirm_btn(call):
-            self.bot.send_chat_action(message.chat.id, 'typing')
-            process_message = self.bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.id,
-                                                    text="Идет обработка заметки...")
+    def process_forward(self, message: telebot.types.Message):
+        """Пересланный пост из канала, чата или от пользователя"""
+        text = message.text or message.caption or ''
+        if not text.strip():
+            self.bot.reply_to(message, "В пересланном сообщении нет текста — пока я умею сохранять только текст")
+            return
 
-            _, message_chat_id, message_from_user_id, message_id = call.data.split('_')
-            try:
-                # Загрузка и парсинг веб-страницы
-                document = Document(TEXT)
-                print(document)
-                document.metadata['user_id'] = message.from_user.id
-                document.metadata['added_date'] = datetime.now().isoformat()
-                document.metadata['summary'] = self.summarize_document(document, message)
+        source, title = forward_source(message)
+        user_id = message.from_user.id
 
-                # add doc to db
-                add_document(
-                    user_id = document.metadata.get('user_id', ''),
-                    added_date=datetime.fromisoformat(document.metadata.get('added_date', '')),
-                    source=f'https://t.me/c/{message_chat_id}/{message_id}',
-                    title=document.metadata.get('title', ''),
-                    all_content=document.page_content,
-                    summarize=document.metadata.get('summary', '')
-                )
-                # TODO: make semantic search
-                self.add_documents_to_vectorstore([document])
-                response = f"✅ Заметка успешно добавлена!\n\n📝 Краткое содержание:\n{document.metadata['summary']}"
-                self.bot.reply_to(message, response)
+        if source and document_exists(user_id, source):
+            self.bot.reply_to(message, "Этот пост уже есть в вашем архиве")
+            return
 
-            except Exception as e:
-                logger.error(f"Error processing URL: {e}")
-                self.bot.reply_to(message, f"Ошибка при обработке заметки: {str(e)}")
-            finally:
-                # удаляем сообщение о процессинге
-                self.bot.delete_message(chat_id=message.chat.id, message_id=process_message.id)
+        self.bot.send_chat_action(message.chat.id, 'typing')
+        process_message = self.bot.reply_to(message, "Идет обработка поста...")
+        try:
+            document = Document(page_content=text, metadata={
+                'source': source or message_link(message.chat, message.message_id),
+                'title': title,
+            })
+            summary = self.save_to_archive(document, user_id, message)
+            self.bot.reply_to(message, f"✅ Пост сохранён: {title}\n\n📝 Краткое содержание:\n{summary}",
+                              disable_web_page_preview=True)
+        except Exception as e:
+            logger.error(f"Error processing forward: {e}")
+            self.bot.reply_to(message, f"Ошибка при обработке поста: {str(e)}")
+        finally:
+            self.bot.delete_message(chat_id=message.chat.id, message_id=process_message.id)
 
     def process_url(self, message: telebot.types.Message):
         """Обработка URL"""
@@ -408,6 +480,8 @@ class DocumentRAGBot(RAG):
                     all_content=document.page_content,
                     summarize=document.metadata.get('summary', '')
                 )
+                # Без этого документ попадал только в SQLite и не находился поиском
+                self.add_documents_to_vectorstore([document])
 
                 response = f"✅ Документ успешно добавлен!\n\n📝 Краткое содержание:\n{document.metadata['summary']}"
                 self.bot.reply_to(message, response)
@@ -446,3 +520,53 @@ def format_documents_compact(documents):
         )
     text = "\n".join(lines)
     return text
+
+
+
+def is_forwarded(message: telebot.types.Message) -> bool:
+    """Переслано ли сообщение (новое поле forward_origin и старые поля Bot API)"""
+    return bool(getattr(message, 'forward_origin', None)
+                or getattr(message, 'forward_from_chat', None)
+                or getattr(message, 'forward_from', None)
+                or getattr(message, 'forward_sender_name', None))
+
+
+def message_link(chat, message_id: int) -> str:
+    """Ссылка на сообщение. Для публичных каналов и чатов — t.me/<username>/<id>,
+    для приватных супергрупп и каналов — t.me/c/<id>/<id>. У личной переписки
+    с ботом публичной ссылки нет, поэтому возвращаем уникальный идентификатор:
+    по source дедуплицируется недельный отчёт."""
+    if chat is None or message_id is None:
+        return ''
+    if getattr(chat, 'username', None):
+        return f'https://t.me/{chat.username}/{message_id}'
+    chat_id = str(chat.id)
+    if chat_id.startswith('-100'):
+        return f'https://t.me/c/{chat_id[4:]}/{message_id}'
+    return f'telegram:{chat_id}/{message_id}'
+
+
+def forward_source(message: telebot.types.Message):
+    """Возвращает (ссылка на оригинал или '', название источника) для пересланного сообщения"""
+    origin = getattr(message, 'forward_origin', None)
+    if origin is not None:
+        if origin.type == 'channel':
+            return message_link(origin.chat, origin.message_id), origin.chat.title or 'Канал'
+        if origin.type == 'chat':
+            return '', origin.sender_chat.title or 'Чат'
+        if origin.type == 'user':
+            return '', full_name(origin.sender_user)
+        if origin.type == 'hidden_user':
+            return '', origin.sender_user_name or 'Скрытый пользователь'
+
+    # Старые поля Bot API (pyTelegramBotAPI < 4.15)
+    chat = getattr(message, 'forward_from_chat', None)
+    if chat is not None:
+        return message_link(chat, getattr(message, 'forward_from_message_id', None)), chat.title or 'Канал'
+    if getattr(message, 'forward_from', None):
+        return '', full_name(message.forward_from)
+    return '', getattr(message, 'forward_sender_name', None) or 'Пересланное сообщение'
+
+
+def full_name(user) -> str:
+    return ' '.join(filter(None, [user.first_name, user.last_name])) or user.username or 'Пользователь'
