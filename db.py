@@ -58,6 +58,18 @@ def add_document(user_id, added_date, source, title, all_content, summarize):
         session.close()
 
 
+def document_exists(user_id: int, source: str) -> bool:
+    """Есть ли у пользователя документ с таким источником (защита от повторной пересылки поста)"""
+    session = Session()
+    try:
+        stmt = select(Document.id).where(
+            and_(Document.user_id == user_id, Document.source == source)
+        ).limit(1)
+        return session.execute(stmt).first() is not None
+    finally:
+        session.close()
+
+
 def get_current_week_documents(user_id: Optional[int] = None) -> Sequence[Row[Any] | RowMapping | Any]:
     """
     Получение документов за текущую неделю
